@@ -290,6 +290,7 @@ class GenADHead(DETRHead):
         self.loss_plan_bound = build_loss(loss_plan_bound)
         self.loss_plan_col = build_loss(loss_plan_col)
         self.loss_plan_dir = build_loss(loss_plan_dir)
+        # VAE Loss.
         self.loss_vae_gen = build_loss(loss_vae_gen)
 
     def _init_layers(self):
@@ -387,8 +388,10 @@ class GenADHead(DETRHead):
                 [map_reg_branch for _ in range(map_num_pred)])
 
         if not self.as_two_stage:
+            # [100 * 100, 256]
             self.bev_embedding = nn.Embedding(
                 self.bev_h * self.bev_w, self.embed_dims)
+            # [300, 256 * 2]
             self.query_embedding = nn.Embedding(self.num_query,
                                                 self.embed_dims * 2)
             if self.map_query_embed_type == 'all_pts':
@@ -396,7 +399,9 @@ class GenADHead(DETRHead):
                                                         self.embed_dims * 2)
             elif self.map_query_embed_type == 'instance_pts':
                 self.map_query_embedding = None
+                # [100, 256 * 2]
                 self.map_instance_embedding = nn.Embedding(self.map_num_vec, self.embed_dims * 2)
+                # [20, 256 * 2]
                 self.map_pts_embedding = nn.Embedding(self.map_num_pts_per_vec, self.embed_dims * 2)
 
         if self.motion_decoder is not None:
@@ -422,8 +427,11 @@ class GenADHead(DETRHead):
         self.ego_agent_pos_mlp = nn.Linear(2, self.embed_dims)
 
         ego_fut_decoder = []
+        # 这里 self.embed_dims * 2 是为了和 current_states 的最后一个维度保持一致.
+        # # current_states 是由 motion_hs 和 ca_motion_query 拼接而成的.
         ego_fut_dec_in_dim = self.embed_dims * 2 + len(self.ego_lcf_feat_idx) \
             if self.ego_lcf_feat_idx is not None else self.embed_dims * 2
+        # self.with_cur 表示是否包含当前状态.
         if self.with_cur:
             ego_fut_dec_in_dim = int(ego_fut_dec_in_dim * 2)
         for _ in range(self.num_reg_fcs):
@@ -460,10 +468,10 @@ class GenADHead(DETRHead):
 
         # Future prediction
         self.predict_model = PredictModel(
-            in_channels=self.latent_dim,
-            out_channels=self.embed_dims * 2,
-            hidden_channels=self.latent_dim * 4,
-            num_layers=self.layer_dim
+            in_channels=self.latent_dim, # 32
+            out_channels=self.embed_dims * 2, # 256 * 2
+            hidden_channels=self.latent_dim * 4, # 32 * 4
+            num_layers=self.layer_dim # 4
         )
 
 
@@ -541,22 +549,28 @@ class GenADHead(DETRHead):
                 Shape [nb_dec, bs, num_query, 9].
         """
 
+        # mlvl_feats[0]的维度为[B, N, C, H, W], 分别代表 batch size, camera num, channel, height, width.
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
-        object_query_embeds = self.query_embedding.weight.to(dtype)
+        object_query_embeds = self.query_embedding.weight.to(dtype) # [num_query, embed_dims * 2], [300, 256 * 2]
 
         if self.map_query_embed_type == 'all_pts':
             map_query_embeds = self.map_query_embedding.weight.to(dtype)
         elif self.map_query_embed_type == 'instance_pts':
-            map_pts_embeds = self.map_pts_embedding.weight.unsqueeze(0)
-            map_instance_embeds = self.map_instance_embedding.weight.unsqueeze(1)
-            map_query_embeds = (map_pts_embeds + map_instance_embeds).flatten(0, 1).to(dtype)
+            # map_pts 表示一个实例的点的个数.
+            # map_instance 表示实例的个数(车道线, 路沿等元素).
+            map_pts_embeds = self.map_pts_embedding.weight.unsqueeze(0) # [1, 20, 256 * 2]
+            map_instance_embeds = self.map_instance_embedding.weight.unsqueeze(1) # [100, 1, 256 * 2]
+            map_query_embeds = (map_pts_embeds + map_instance_embeds).flatten(0, 1).to(dtype) # [2000, 256 * 2]
 
+        # [bev_h * bev_w, embed_dims], [100 * 100, 256]
         bev_queries = self.bev_embedding.weight.to(dtype)
-
+        # [B, bev_h, bev_w]
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
                                device=bev_queries.device).to(dtype)
-        bev_pos = self.positional_encoding(bev_mask).to(dtype)
+        # from DETRHead, class SinePositionalEncoding.
+        # /home/xpeng/.local/lib/python3.8/site-packages/mmdet/models/utils/positional_encoding.py
+        bev_pos = self.positional_encoding(bev_mask).to(dtype) # [B, bev_h, bev_w, num_feats(128) * 2]
 
         if only_bev:  # only use encoder to obtain BEV features, TODO: refine the workaround
             return self.transformer.get_bev_features(
@@ -571,6 +585,7 @@ class GenADHead(DETRHead):
                 prev_bev=prev_bev,
             )
         else:
+            # class GenADPerceptionTransformer
             outputs = self.transformer(
                 mlvl_feats,
                 bev_queries,
@@ -729,6 +744,7 @@ class GenADHead(DETRHead):
                     map_thresh=self.map_thresh, dis_thresh=self.dis_thresh,
                     pe_normalization=self.pe_normalization, use_fix_pad=True)
                 map_query = map_query.permute(1, 0, 2)  # [P, B*M, D]
+                # ca = Cross Attention.
                 ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0)
 
                 # position encoding
@@ -753,7 +769,7 @@ class GenADHead(DETRHead):
 
             ########################################
             # generator for planning & motion
-            current_states = torch.cat((motion_hs.permute(1, 0, 2), ca_motion_query.reshape(batch_size, -1, self.embed_dims)), dim=2)
+            current_states = torch.cat((motion_hs.permute(1, 0, 2), ca_motion_query.reshape(batch_size, -1, self.embed_dims)), dim=2) # [B, M, embed_dims * 2]
             distribution_comp = {}
             # states = torch.randn((2, 1, 64, 200, 200), device=motion_hs.device)
             # future_distribution_inputs = torch.randn((2, 5, 6, 200, 200), device=motion_hs.device)
@@ -765,6 +781,9 @@ class GenADHead(DETRHead):
                 future_distribution_inputs = None
 
             # 1. model CVA distribution for state
+            # CVA: Conditional Variational Autoencoder, 表示条件变分自编码器.
+            # 目的是为当前的车辆和智能体状态建模一个概率分布.
+            # CVA 分布建模是 VAE 的编码阶段.
             if self.fut_ts > 0:
                 # present_state = states[:, :1].contiguous()
                 if self.probabilistic:
@@ -775,6 +794,7 @@ class GenADHead(DETRHead):
                     distribution_comp = {**distribution_comp, **output_distribution}
 
             # 2. predict future state from distribution
+            # 从分布预测未来状态, VAE 的解码阶段.
             hidden_states = current_states
             states_hs, future_states_hs = self.future_states_predict(
                 batch_size=batch_size,
@@ -783,6 +803,7 @@ class GenADHead(DETRHead):
                 current_states=current_states
             )
 
+            # self.agent_dim = 300, self.fut_mode = 6
             ego_query_hs = states_hs[:, :, self.agent_dim * self.fut_mode, :].unsqueeze(1).permute(0, 2, 1, 3)
             motion_query_hs = states_hs[:, :, 0:self.agent_dim * self.fut_mode, :]
             motion_query_hs = motion_query_hs.reshape(self.fut_ts, batch_size, -1, self.fut_ts, motion_query_hs.shape[-1])
@@ -1950,13 +1971,16 @@ class GenADHead(DETRHead):
 
         b = present_features.shape[0]
         c = present_features.shape[1]
+        # Present分布 (无条件VAE)
         present_mu, present_log_sigma = self.present_distribution(present_features)
 
         future_mu, future_log_sigma = None, None
+        # Future分布 (条件VAE，仅训练时使用)
         if future_distribution_inputs is not None:
             # Concatenate future labels to z_t
             # future_features = future_distribution_inputs[:, 1:].contiguous().view(b, 1, -1, h, w)
             future_features = torch.cat([present_features, future_distribution_inputs], dim=2)
+            # class DistributionModule
             future_mu, future_log_sigma = self.future_distribution(future_features)
 
         if noise is None:
@@ -1967,6 +1991,7 @@ class GenADHead(DETRHead):
         # print('################################')
         # print('noise: ', noise)
         # print('################################')
+        # 重参数化技巧 (Reparameterization Trick)
         if self.training:
             mu = future_mu
             sigma = torch.exp(future_log_sigma)
@@ -1988,7 +2013,7 @@ class GenADHead(DETRHead):
         return sample, output_distribution
 
     def get_future_labels(self, gt_labels_3d, gt_attr_labels, ego_fut_trajs, device):
-
+        # 为条件变分自编码器(CVA)准备未来轨迹的 Ground Truth 标签数据
         """get_future_label.
         Args:
             gt_labels_3d: agent future 3d labels
@@ -2066,16 +2091,23 @@ class GenADHead(DETRHead):
                   future_states_hs: the generative features predicted by generate model(VAE)
               """
 
+        # sample: [B, D, C]?
+        # self.fut_ts = 6 means predict 6 time steps in the future?
+        # self.latent_dim = 32
+        # 使用采样的潜在变量预测未来6个时间步
         future_prediction_input = sample.unsqueeze(0).expand(self.fut_ts, -1, -1, -1)
         future_prediction_input = future_prediction_input.reshape(self.fut_ts, -1, self.latent_dim)
 
         hidden_state = hidden_states.reshape(self.layer_dim, -1, int(self.embed_dims / 2))
+        # class PredictModel, the layer contains nn.GRU
+        # 通过GRU解码器生成未来状态
         future_states = self.predict_model(future_prediction_input, hidden_state)
 
         current_states_hs = current_states.unsqueeze(0).repeat(6, 1, 1, 1)
         future_states_hs = future_states.reshape(self.fut_ts, batch_size, -1, future_states.shape[2])
 
         if self.with_cur:
+            # 结合当前状态和预测的未来状态
             states_hs = torch.cat((current_states_hs, future_states_hs), dim=-1)
         else:
             states_hs = future_states_hs
